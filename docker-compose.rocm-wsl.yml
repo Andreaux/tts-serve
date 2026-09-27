@@ -1,0 +1,166 @@
+# AMD / ROCm under WSL2 overlay. Use with docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.rocm-wsl.yml --profile <engine> up -d --build
+#
+# This is the WSL2 sibling of docker-compose.rocm.yml. Use THIS one when the
+# Docker Engine is running inside a WSL2 distro on Windows; use the plain
+# .rocm.yml on native Linux. They differ in how the GPU is reached:
+#
+#   native Linux : /dev/kfd + /dev/dri
+#   WSL2         : /dev/dxg + the host libraries WSL mounts at /usr/lib/wsl
+#
+# VERIFIED on an RX 7800 XT (gfx1101) under Ubuntu-24.04 WSL2 with ROCm 6.4.4:
+# torch.cuda.is_available() True, device reported as "AMD Radeon RX 7800 XT",
+# 36.8 TFLOPS fp16 measured from inside a container.
+#
+# ── The one non-obvious part ──────────────────────────────────────────────────
+# PyTorch's ROCm wheels BUNDLE their own libhsa-runtime64.so, and it is the
+# NATIVE build that talks to /dev/kfd. Inside WSL that device does not exist, so
+# torch silently reports is_available() == False even though rocminfo sees the
+# card perfectly well. The fix is to shadow torch's bundled copy with the WSL
+# runtime from hsa-runtime-rocr4wsl-amdgpu (installed on the host by
+# `amdgpu-install --usecase=wsl,rocm --no-dkms`). That is what the third bind
+# mount on each service does.
+#
+# The mount target is python-version specific, which is why it is spelled out
+# per service instead of living in the shared anchor: IndexTTS is on Python 3.11
+# and the other three are on 3.12.
+#
+# Host prerequisites:
+#   1. ROCm installed in the WSL distro (amdgpu-install --usecase=wsl,rocm --no-dkms)
+#   2. Docker ENGINE inside that distro -- Docker Desktop does NOT pass /dev/dxg
+#   3. A Windows AMD driver providing /dev/dxg (any current Adrenalin build)
+
+x-rocm-wsl: &rocm-wsl
+  devices:
+    - /dev/dxg
+  environment: &rocm-wsl-env
+    # WSL's host driver shims (libdxcore.so) live here; the WSL HSA runtime
+    # needs them on the loader path.
+    LD_LIBRARY_PATH: /usr/lib/wsl/lib
+    # Triton supports ROCm, so torch.compile stays enabled (unlike Pascal).
+    TORCHDYNAMO_DISABLE: "${TORCHDYNAMO_DISABLE:-0}"
+    PYTORCH_HIP_ALLOC_CONF: "expandable_segments:True"
+    # HSA_OVERRIDE_GFX_VERSION is deliberately NOT set here. Passing it EMPTY
+    # is not the same as unset: the HSA runtime logs "HSA_OVERRIDE_GFX_VERSION
+    # is invalid" and torch then reports "No HIP GPUs are available". An RX
+    # 7800 XT (gfx1101) needs no override; for a card that does, add e.g.
+    #   HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+    # to that service's environment.
+
+services:
+  chatterbox:
+    <<: *rocm-wsl
+    image: tts-serve/chatterbox:rocm-wsl
+    build:
+      args:
+        # Chatterbox pins torch==2.6.0; rocm6.2.4 is the ROCm index carrying it.
+        # Note this is an older ROCm line than the host's 6.4.4 runtime -- the
+        # bundled HIP libs are 6.2.4 but the HSA runtime is shadowed with the
+        # host's 6.4.4 WSL build, which is the combination actually exercised.
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.2.4
+        TORCH: "2.6.0"
+        TORCHAUDIO: "2.6.0"
+        TORCHVISION: "0.21.0"
+        TORCH_BUILD_TAG: rocm6.2.4
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - ${ROCM_WSL_HSA:-/opt/rocm/lib/libhsa-runtime64.so.1}:/usr/local/lib/python3.12/site-packages/torch/lib/libhsa-runtime64.so:ro
+    environment: *rocm-wsl-env
+
+  qwen3tts:
+    <<: *rocm-wsl
+    image: tts-serve/qwen3tts:rocm-wsl
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - ${ROCM_WSL_HSA:-/opt/rocm/lib/libhsa-runtime64.so.1}:/usr/local/lib/python3.12/site-packages/torch/lib/libhsa-runtime64.so:ro
+    environment: *rocm-wsl-env
+
+  voxcpm:
+    <<: *rocm-wsl
+    image: tts-serve/voxcpm:rocm-wsl
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - ${ROCM_WSL_HSA:-/opt/rocm/lib/libhsa-runtime64.so.1}:/usr/local/lib/python3.12/site-packages/torch/lib/libhsa-runtime64.so:ro
+    environment: *rocm-wsl-env
+
+  indextts:
+    <<: *rocm-wsl
+    image: tts-serve/indextts:rocm-wsl
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+        # flash-attn and deepspeed have ROCm builds, so --all-extras is
+        # plausible here (unlike Pascal). Left off until exercised.
+        INDEXTTS_EXTRAS: ""
+    # NOTE the python3.11 path -- IndexTTS pins requires-python <3.12.
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - ${ROCM_WSL_HSA:-/opt/rocm/lib/libhsa-runtime64.so.1}:/usr/local/lib/python3.11/site-packages/torch/lib/libhsa-runtime64.so:ro
+    environment:
+      <<: *rocm-wsl-env
+      INDEXTTS_USE_BF16: "${INDEXTTS_USE_BF16:-}"
+      INDEXTTS_USE_QWEN_EMO: "${INDEXTTS_USE_QWEN_EMO:-}"
+
+  omnivoice:
+    <<: *rocm-wsl
+    image: tts-serve/omnivoice:rocm-wsl
+    build:
+      args:
+        # rocm6.4 matches the host's 6.4.4 WSL HSA runtime that gets shadowed
+        # in below. (Chatterbox's forced rocm6.2.4 does NOT: error 100.)
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - ${ROCM_WSL_HSA:-/opt/rocm/lib/libhsa-runtime64.so.1}:/usr/local/lib/python3.12/site-packages/torch/lib/libhsa-runtime64.so:ro
+      # MIOpen compiles kernels per input shape on first use (10-30 s each on
+      # this card). Persist them, or every container recreate starts cold.
+      - tts-miopen:/miopen
+    environment:
+      <<: *rocm-wsl-env
+      MIOPEN_USER_DB_PATH: /miopen/db
+      MIOPEN_CUSTOM_CACHE_DIR: /miopen/cache
+
+  luxtts:
+    <<: *rocm-wsl
+    image: tts-serve/luxtts:rocm-wsl
+    build:
+      args:
+        # Same rocm6.4 line as OmniVoice, to match the host's WSL HSA runtime.
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - ${ROCM_WSL_HSA:-/opt/rocm/lib/libhsa-runtime64.so.1}:/usr/local/lib/python3.12/site-packages/torch/lib/libhsa-runtime64.so:ro
+      - tts-miopen:/miopen
+    environment:
+      <<: *rocm-wsl-env
+      MIOPEN_USER_DB_PATH: /miopen/db
+      MIOPEN_CUSTOM_CACHE_DIR: /miopen/cache
+
+volumes:
+  tts-miopen:

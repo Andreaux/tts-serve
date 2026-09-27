@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1
+# LuxTTS -- 48 kHz, ZipVoice distilled to 4 sampling steps (the fast one).
+# No reference transcript: the engine always transcribes the reference clip
+# itself with Whisper (whisper-base on GPU), paid on every request.
+# English and Chinese only.
+#
+# Backend-agnostic: build args select CUDA or ROCm. See the compose overlays.
+#   CUDA: TORCH_INDEX=.../cu126   TORCH=2.8.0  TORCH_BUILD_TAG=cu126
+#   ROCm: TORCH_INDEX=.../rocm6.4 TORCH=2.8.0  TORCH_BUILD_TAG=rocm6.4
+#
+# LuxTTS asks for an unpinned torch, so pick whatever matches the host runtime
+# (under WSL: the rocm6.4 line, same as OmniVoice).
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/models/hf \
+    PIP_CONSTRAINT=/opt/tts/constraints.txt \
+    UV_CONSTRAINT=/opt/tts/constraints.txt \
+    CUDA_MODULE_LOADING=LAZY
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates ffmpeg libsndfile1 libnuma1 libelf1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
+ARG TORCH=2.8.0
+ARG TORCHAUDIO=2.8.0
+ARG TORCHVISION=0.23.0
+ARG TORCH_BUILD_TAG=cu126
+
+RUN mkdir -p /opt/tts \
+ && printf 'torch==%s\ntorchaudio==%s\ntorchvision==%s\n' "$TORCH" "$TORCHAUDIO" "$TORCHVISION" \
+      > /opt/tts/constraints.txt \
+ && pip install --index-url "$TORCH_INDEX" \
+        "torch==$TORCH" "torchaudio==$TORCHAUDIO" "torchvision==$TORCHVISION"
+
+# LuxTTS is a git repo, not a PyPI package, and install is two steps (see
+# impl/server_luxTTS.md): its requirements.txt (which pulls the git-only
+# linacodec and piper_phonemize from k2-fsa's wheel page), then the package
+# itself with --no-deps -- skipping the second step leaves `zipvoice` missing.
+# Pinned to a commit: an unpinned clone makes the image unreproducible.
+ARG LUXTTS_REF=28ae6a61151684fffc9d1a7aa15eafa02286fe0b
+RUN git clone https://github.com/ysharma3501/LuxTTS.git /opt/LuxTTS \
+ && git -C /opt/LuxTTS checkout "$LUXTTS_REF" \
+ && pip install -r /opt/LuxTTS/requirements.txt \
+ && pip install /opt/LuxTTS --no-deps
+
+COPY tts-engine-common /opt/tts/tts-engine-common
+RUN pip install /opt/tts/tts-engine-common fastapi uvicorn loguru soundfile
+
+RUN python -c "import sys,torch;v=torch.__version__;t='${TORCH_BUILD_TAG}';print('torch:',v,'| required backend tag:',t);sys.exit(0 if t in v else 'FATAL: torch '+v+' is not a '+t+' build; it cannot run on the target GPU.')"
+
+COPY impl /opt/tts/impl
+COPY tools /opt/tts/tools
+WORKDIR /opt/tts
+
+ENV LUX_TTS_HOST=0.0.0.0 \
+    LUX_TTS_PORT=7500 \
+    LUX_TTS_DEVICE=cuda
+
+EXPOSE 7500
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15m --retries=3 \
+    CMD curl -fsS http://127.0.0.1:${LUX_TTS_PORT}/health || exit 1
+
+CMD ["python", "impl/server_luxTTS.py"]

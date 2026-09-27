@@ -1,0 +1,106 @@
+# NVIDIA / CUDA overlay. Use with docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml --profile <engine> up -d --build
+#
+# Pinned to the cu126 wheels because the target is a Tesla P40 (Pascal, sm_61).
+# PyTorch's cu128/cu129 wheels dropped Pascal: they install cleanly and then die
+# at the first kernel launch. On an Ampere-or-newer card you can raise these to
+# a cu128 index -- nothing else in the stack needs to change.
+#
+# TORCHDYNAMO_DISABLE defaults to 1 here because Triton (the torch.compile
+# inductor backend) refuses CUDA capability < 7.0, which is fatal for VoxCPM on
+# Pascal. On a newer NVIDIA card, set TORCHDYNAMO_DISABLE=0 in .env.
+
+x-cuda-gpu: &cuda-gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+x-cuda-env: &cuda-env
+  TORCHDYNAMO_DISABLE: "${TORCHDYNAMO_DISABLE:-1}"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+services:
+  chatterbox:
+    <<: *cuda-gpu
+    image: tts-serve/chatterbox:cu126
+    build:
+      args:
+        # Chatterbox pins torch==2.6.0 exactly.
+        TORCH_INDEX: https://download.pytorch.org/whl/cu126
+        TORCH: "2.6.0"
+        TORCHAUDIO: "2.6.0"
+        TORCHVISION: "0.21.0"
+        TORCH_BUILD_TAG: cu126
+    environment: *cuda-env
+
+  qwen3tts:
+    <<: *cuda-gpu
+    image: tts-serve/qwen3tts:cu126
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/cu126
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: cu126
+    environment: *cuda-env
+
+  voxcpm:
+    <<: *cuda-gpu
+    image: tts-serve/voxcpm:cu126
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/cu126
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: cu126
+    environment: *cuda-env
+
+  indextts:
+    <<: *cuda-gpu
+    image: tts-serve/indextts:cu126
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/cu126
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: cu126
+        # Pascal cannot use flash-attn (sm_80+), the torch_compile extra
+        # (Triton, sm_70+), or deepspeed (needs a CUDA toolkit). Core deps only.
+        INDEXTTS_EXTRAS: ""
+    environment:
+      <<: *cuda-env
+      INDEXTTS_USE_BF16: "${INDEXTTS_USE_BF16:-}"
+      INDEXTTS_USE_QWEN_EMO: "${INDEXTTS_USE_QWEN_EMO:-}"
+
+  # OmniVoice and LuxTTS are verified under ROCm/WSL2 only; their CUDA builds
+  # follow the same pattern but have not been run on NVIDIA yet.
+  omnivoice:
+    <<: *cuda-gpu
+    image: tts-serve/omnivoice:cu126
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/cu126
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: cu126
+    environment: *cuda-env
+
+  luxtts:
+    <<: *cuda-gpu
+    image: tts-serve/luxtts:cu126
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/cu126
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: cu126
+    environment: *cuda-env

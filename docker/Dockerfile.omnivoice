@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1
+# OmniVoice -- 24 kHz, the fastest engine here. The reference transcript is
+# optional; without it the server lazily loads a Whisper ASR model (slow once).
+#
+# Backend-agnostic: build args select CUDA or ROCm. See the compose overlays.
+#   CUDA: TORCH_INDEX=.../cu126   TORCH=2.8.0  TORCH_BUILD_TAG=cu126
+#   ROCm: TORCH_INDEX=.../rocm6.4 TORCH=2.8.0  TORCH_BUILD_TAG=rocm6.4
+#
+# OmniVoice only asks for torch>=2.4, so pick whatever matches the host runtime.
+# Under WSL that matters: the shadowed HSA runtime is the host's ROCm 6.4.4, and
+# torch's bundled HIP libs must be the same line (a rocm6.2.4 wheel fails with
+# hipErrorNoDevice / error 100).
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/models/hf \
+    PIP_CONSTRAINT=/opt/tts/constraints.txt \
+    UV_CONSTRAINT=/opt/tts/constraints.txt \
+    CUDA_MODULE_LOADING=LAZY
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates ffmpeg libsndfile1 libnuma1 libelf1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
+ARG TORCH=2.8.0
+ARG TORCHAUDIO=2.8.0
+ARG TORCHVISION=0.23.0
+ARG TORCH_BUILD_TAG=cu126
+
+RUN mkdir -p /opt/tts \
+ && printf 'torch==%s\ntorchaudio==%s\ntorchvision==%s\n' "$TORCH" "$TORCHAUDIO" "$TORCHVISION" \
+      > /opt/tts/constraints.txt \
+ && pip install --index-url "$TORCH_INDEX" \
+        "torch==$TORCH" "torchaudio==$TORCHAUDIO" "torchvision==$TORCHVISION"
+
+RUN pip install omnivoice
+
+COPY tts-engine-common /opt/tts/tts-engine-common
+RUN pip install /opt/tts/tts-engine-common fastapi uvicorn loguru soundfile
+
+RUN python -c "import sys,torch;v=torch.__version__;t='${TORCH_BUILD_TAG}';print('torch:',v,'| required backend tag:',t);sys.exit(0 if t in v else 'FATAL: torch '+v+' is not a '+t+' build; it cannot run on the target GPU.')"
+
+COPY impl /opt/tts/impl
+COPY tools /opt/tts/tools
+WORKDIR /opt/tts
+
+ENV OMNIVOICE_HOST=0.0.0.0 \
+    OMNIVOICE_PORT=7500 \
+    OMNIVOICE_DEVICE=cuda
+
+EXPOSE 7500
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15m --retries=3 \
+    CMD curl -fsS http://127.0.0.1:${OMNIVOICE_PORT}/health || exit 1
+
+CMD ["python", "impl/server_omnivoice.py"]

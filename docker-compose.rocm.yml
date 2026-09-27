@@ -1,0 +1,142 @@
+# AMD / ROCm overlay. Use with docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.rocm.yml --profile <engine> up -d --build
+#
+# ===========================================================================
+# UNTESTED. The CUDA path is verified end to end on a Tesla P40; this one has
+# never been run, because no AMD GPU was available to test it on. Treat it as a
+# starting point, not a known-good configuration.
+# ===========================================================================
+#
+# Targets NATIVE LINUX ROCm, where the GPU appears as /dev/kfd + /dev/dri.
+# Verified to exist on the PyTorch index: torch 2.6.0 on rocm6.2.4 (Chatterbox's
+# hard pin) and torch 2.8.0 on rocm6.4 (the other three).
+#
+# The application code needs no changes at all: PyTorch's ROCm build exposes AMD
+# GPUs through the same torch.cuda API and the same "cuda" device string, which
+# is what every tts-serve server already checks for. Leave *_DEVICE=cuda.
+#
+# torch.compile is left ENABLED here (TORCHDYNAMO_DISABLE defaults to 0):
+# Triton supports ROCm, so VoxCPM does not need the Pascal workaround.
+#
+# Not for WSL2: there the GPU is /dev/dxg, not /dev/kfd, and torch needs the
+# host's WSL HSA runtime. Use docker-compose.rocm-wsl.yml instead (verified on
+# an RX 7800 XT) and see windows/README.md.
+
+x-rocm-gpu: &rocm-gpu
+  devices:
+    - /dev/kfd
+    - /dev/dri
+  group_add:
+    - video
+    - render
+  security_opt:
+    - seccomp:unconfined
+  ipc: host
+
+x-rocm-env: &rocm-env
+  # Triton works on ROCm, so compilation stays on unless you opt out.
+  TORCHDYNAMO_DISABLE: "${TORCHDYNAMO_DISABLE:-0}"
+  PYTORCH_HIP_ALLOC_CONF: "expandable_segments:True"
+  # HSA_OVERRIDE_GFX_VERSION is deliberately NOT set here. Passing it EMPTY is
+  # not the same as unset: the HSA runtime logs "HSA_OVERRIDE_GFX_VERSION is
+  # invalid" and torch then reports no GPU (found under WSL2; same runtime).
+  # Only cards outside ROCm's supported gfx list need it -- then add e.g.
+  #   HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+  # to that service's environment. An RX 7800 XT (gfx1101) needs none.
+
+services:
+  chatterbox:
+    <<: *rocm-gpu
+    image: tts-serve/chatterbox:rocm6.2.4
+    build:
+      args:
+        # Chatterbox pins torch==2.6.0; rocm6.2.4 is the ROCm index that has it
+        # (rocm6.3 and 6.4 start at 2.8.0).
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.2.4
+        TORCH: "2.6.0"
+        TORCHAUDIO: "2.6.0"
+        TORCHVISION: "0.21.0"
+        TORCH_BUILD_TAG: rocm6.2.4
+    environment: *rocm-env
+
+  qwen3tts:
+    <<: *rocm-gpu
+    image: tts-serve/qwen3tts:rocm6.4
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+    environment: *rocm-env
+
+  voxcpm:
+    <<: *rocm-gpu
+    image: tts-serve/voxcpm:rocm6.4
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+    environment: *rocm-env
+
+  indextts:
+    <<: *rocm-gpu
+    image: tts-serve/indextts:rocm6.4
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+        # flash-attn and deepspeed DO have ROCm builds, so "--all-extras" is
+        # plausible here (unlike Pascal). Left off by default: it is a much
+        # heavier build and, like the rest of this file, unverified.
+        INDEXTTS_EXTRAS: ""
+    environment:
+      <<: *rocm-env
+      INDEXTTS_USE_BF16: "${INDEXTTS_USE_BF16:-}"
+      INDEXTTS_USE_QWEN_EMO: "${INDEXTTS_USE_QWEN_EMO:-}"
+
+  omnivoice:
+    <<: *rocm-gpu
+    image: tts-serve/omnivoice:rocm6.4
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+    volumes:
+      # MIOpen compiles kernels per input shape on first use (10-30 s each
+      # under WSL2). Persist them, or every container recreate starts cold.
+      - tts-miopen:/miopen
+    environment:
+      <<: *rocm-env
+      MIOPEN_USER_DB_PATH: /miopen/db
+      MIOPEN_CUSTOM_CACHE_DIR: /miopen/cache
+
+  luxtts:
+    <<: *rocm-gpu
+    image: tts-serve/luxtts:rocm6.4
+    build:
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/rocm6.4
+        TORCH: "2.8.0"
+        TORCHAUDIO: "2.8.0"
+        TORCHVISION: "0.23.0"
+        TORCH_BUILD_TAG: rocm6.4
+    volumes:
+      - tts-miopen:/miopen
+    environment:
+      <<: *rocm-env
+      MIOPEN_USER_DB_PATH: /miopen/db
+      MIOPEN_CUSTOM_CACHE_DIR: /miopen/cache
+
+volumes:
+  tts-miopen:

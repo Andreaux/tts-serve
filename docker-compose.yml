@@ -1,0 +1,100 @@
+# tts-serve -- backend-agnostic base.
+#
+# This file alone does NOT start anything: it carries no GPU wiring and no torch
+# versions. Combine it with exactly one backend overlay:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml --profile chatterbox up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.rocm.yml --profile chatterbox up -d --build
+#
+# Simpler: set COMPOSE_FILE in .env (see .env.example) and then just
+#
+#   docker compose --profile chatterbox up -d --build
+#
+# One service per engine, each its own image -- the engines' dependency trees
+# conflict, which is why upstream insists on one venv per engine. A container
+# per engine is the same isolation, enforced harder.
+#
+# All four can run side by side (they bind different host ports), but they
+# contend for VRAM. See docker/README.md for the budget.
+name: tts-serve
+
+x-engine: &engine
+  restart: unless-stopped
+  volumes:
+    # Shared HuggingFace cache. Weights are multi-GB and several engines pull
+    # overlapping files, so keep one cache rather than one per container.
+    - tts-models:/models
+    # Reference voice clips in / generated audio out, visible on the host.
+    - ./testdata:/testdata
+  environment:
+    HF_HOME: /models/hf
+
+services:
+  chatterbox:
+    <<: *engine
+    profiles: ["chatterbox", "all"]
+    container_name: tts-chatterbox
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.chatterbox
+    ports:
+      - "${CHATTERBOX_PORT:-7500}:7500"
+
+  qwen3tts:
+    <<: *engine
+    profiles: ["qwen3tts", "all"]
+    container_name: tts-qwen3tts
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.qwen3tts
+    ports:
+      - "${QWEN3TTS_PORT:-7501}:7500"
+
+  voxcpm:
+    <<: *engine
+    profiles: ["voxcpm", "all"]
+    container_name: tts-voxcpm
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.voxcpm
+    ports:
+      - "${VOXCPM_PORT:-7502}:7500"
+
+  indextts:
+    <<: *engine
+    profiles: ["indextts", "all"]
+    container_name: tts-indextts
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.indextts
+    ports:
+      - "${INDEXTTS_PORT:-7503}:7500"
+    environment:
+      HF_HOME: /models/hf
+      # Set to 1 to halve weight memory if VRAM is tight.
+      INDEXTTS_USE_BF16: "${INDEXTTS_USE_BF16:-}"
+      # Enables the experimental `emotion_text` field (otherwise a 400).
+      INDEXTTS_USE_QWEN_EMO: "${INDEXTTS_USE_QWEN_EMO:-}"
+
+  omnivoice:
+    <<: *engine
+    profiles: ["omnivoice", "all"]
+    container_name: tts-omnivoice
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.omnivoice
+    ports:
+      - "${OMNIVOICE_PORT:-7504}:7500"
+
+  luxtts:
+    <<: *engine
+    profiles: ["luxtts", "all"]
+    container_name: tts-luxtts
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.luxtts
+    ports:
+      - "${LUXTTS_PORT:-7505}:7500"
+
+volumes:
+  tts-models:

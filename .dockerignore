@@ -1,0 +1,9 @@
+.git
+.gitignore
+docs
+*.md
+!tts-engine-common/README.md
+**/__pycache__
+**/*.pyc
+.env
+testdata

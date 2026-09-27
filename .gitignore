@@ -7,7 +7,18 @@ build/
 .venv/
 venv/
 
+# Docker deployment (docker/README.md): local config and voice clips/output
+# dropped into the bind-mounted testdata/ directory.
+.env
+testdata/*
+!testdata/README.md
+
 # mlx environments
 
 .venv-mlx/
 venv-mlx/
+
+# macOS native deployment (macos/README.md)
+macos/venvs/
+macos/logs/
+macos/run/

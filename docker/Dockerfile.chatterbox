@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1
+# Chatterbox -- 24 kHz, conditions on the reference clip alone (no transcript).
+#
+# Backend-agnostic: build args select CUDA or ROCm. See the compose overlays.
+#   CUDA: TORCH_INDEX=.../cu126     TORCH=2.6.0  TORCH_BUILD_TAG=cu126
+#   ROCm: TORCH_INDEX=.../rocm6.2.4 TORCH=2.6.0  TORCH_BUILD_TAG=rocm6.2.4
+#
+# torch is 2.6.0 on BOTH backends because Chatterbox's pyproject demands exactly
+# that; rocm6.2.4 is the ROCm index carrying 2.6.0 (6.3/6.4 start at 2.8.0).
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/models/hf \
+    PIP_CONSTRAINT=/opt/tts/constraints.txt \
+    UV_CONSTRAINT=/opt/tts/constraints.txt \
+    CUDA_MODULE_LOADING=LAZY
+
+# libnuma1 / libelf1 are ROCm runtime requirements; they are a few hundred KB
+# and harmless on CUDA, so the package list stays backend-agnostic.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates ffmpeg libsndfile1 libnuma1 libelf1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Backend selection ─────────────────────────────────────────────────────────
+# NOTHING here is NVIDIA-specific except the default values. Point TORCH_INDEX
+# at a ROCm index and the same Dockerfile produces an AMD image:
+#
+#   CUDA (Pascal P40): https://download.pytorch.org/whl/cu126      tag cu126
+#   ROCm (RDNA3):      https://download.pytorch.org/whl/rocm6.4    tag rocm6.4
+#
+# The compose overlays (docker-compose.cuda.yml / .rocm.yml) set these, so you
+# normally switch backends there rather than here.
+#
+# Two constraints drive the version numbers, and they are not interchangeable
+# between engines: Chatterbox pins torch==2.6.0 exactly, IndexTTS pins 2.8.*.
+# The cu126 index is the last one carrying Pascal (sm_61) kernels at all.
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
+ARG TORCH=2.6.0
+ARG TORCHAUDIO=2.6.0
+ARG TORCHVISION=0.21.0
+ARG TORCH_BUILD_TAG=cu126
+
+# The generated constraints file holds every later install (pip and uv) to
+# exactly these versions, so an engine that drags in a different torch fails
+# loudly at build time instead of silently swapping in a wheel built for the
+# wrong accelerator.
+RUN mkdir -p /opt/tts \
+ && printf 'torch==%s\ntorchaudio==%s\ntorchvision==%s\n' "$TORCH" "$TORCHAUDIO" "$TORCHVISION" \
+      > /opt/tts/constraints.txt \
+ && pip install --index-url "$TORCH_INDEX" \
+        "torch==$TORCH" "torchaudio==$TORCHAUDIO" "torchvision==$TORCHVISION"
+
+# The PyPI release (chatterbox-tts 0.1.7) predates the v3 multilingual API this
+# server needs and reports the same version number, so pin the commit upstream's
+# install doc calls for. Symptom of getting this wrong: the server starts, then
+# dies with an ImportError naming MULTILINGUAL_T3_MODELS.
+RUN pip install "git+https://github.com/resemble-ai/chatterbox.git@5de7a54aa4e5e2baadb0182dde554908b48b85c2"
+
+COPY tts-engine-common /opt/tts/tts-engine-common
+RUN pip install /opt/tts/tts-engine-common fastapi uvicorn loguru soundfile
+
+# Final guard: nothing installed above may have swapped torch for a build
+# targeting the wrong accelerator. A version constraint cannot catch this --
+# `torch==2.8.0` matches 2.8.0+cu126, 2.8.0+cu128 and 2.8.0+rocm6.4 alike, and
+# only one of them runs on any given GPU. (An arch-list check is not possible
+# here: the builder has no GPU, so torch.cuda.get_arch_list() returns [].)
+RUN python -c "import sys,torch;v=torch.__version__;t='${TORCH_BUILD_TAG}';print('torch:',v,'| required backend tag:',t);sys.exit(0 if t in v else 'FATAL: torch '+v+' is not a '+t+' build; it cannot run on the target GPU.')"
+
+# Code last: edits here don't invalidate the expensive layers above.
+COPY impl /opt/tts/impl
+COPY tools /opt/tts/tools
+WORKDIR /opt/tts
+
+ENV CHATTERBOX_HOST=0.0.0.0 \
+    CHATTERBOX_PORT=7500 \
+    CHATTERBOX_DEVICE=cuda
+
+EXPOSE 7500
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15m --retries=3 \
+    CMD curl -fsS http://127.0.0.1:${CHATTERBOX_PORT}/health || exit 1
+
+CMD ["python", "impl/server_chatterbox.py"]
